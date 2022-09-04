@@ -1,0 +1,26 @@
+[Unit]
+Description=Regelwerk MQTT daemon
+After=network.target
+
+[Install]
+WantedBy=multi-user.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/regelwerk -config /run/regelwerk/regelwerk.conf
+PrivateDevices=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+RestrictNamespaces=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+
+# hack for DynamicUser readable config file, systemd < 251
+# see https://github.com/systemd/systemd/issues/16060#issuecomment-964168566
+DynamicUser=yes
+RuntimeDirectory=regelwerk
+ExecStartPre=+bash -c "install -p -m 0660 -o $(stat -c %%u /run/regelwerk) -t /run/regelwerk/ /etc/regelwerk.conf"
+
