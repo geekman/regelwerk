@@ -23,9 +23,12 @@ var (
 	SERVER_URL_RE = regexp.MustCompile(`^[a-z]+://.*:[0-9]{1,5}$`)
 )
 
+// Program config, directly filled by json.Unmarshal
 type config struct {
 	// MQTT server & credentials
 	Server, Username, Password string
+
+	Location [2]float64 // lat, long
 
 	Sensor, Switch string
 }
@@ -37,6 +40,9 @@ type stateSession struct {
 type regelwerk struct {
 	mu     sync.Mutex
 	client mqtt.Client
+
+	lat, lng                  float64
+	currDate, sunrise, sunset time.Time
 
 	sensorId, switchId string
 
@@ -95,6 +101,13 @@ func getMapValue(m map[string]any, key string) string {
 	return vs
 }
 
+// Checks if given Times are for the same day
+func isSameDay(t1, t2 time.Time) bool {
+	y1, m1, d1 := t1.Date()
+	y2, m2, d2 := t2.Date()
+	return y1 == y2 && m1 == m2 && d1 == d2 && t1.Location() == t2.Location()
+}
+
 func (r *regelwerk) handleMqtt(_ mqtt.Client, msg mqtt.Message) {
 	// check for and strip away z2m prefix
 	topic := strings.TrimPrefix(msg.Topic(), MQTT_TOPIC_PREFIX)
@@ -129,6 +142,28 @@ func (r *regelwerk) handleMqtt(_ mqtt.Client, msg mqtt.Message) {
 			return
 		}
 
+		// default dusk/dawn logic, 7pm - 7am
+		shouldTurnOn := ts.Hour() >= 19 || ts.Hour() < 7
+
+		// see if we should compute sunset/sunrise times
+		if r.lat != 0 && r.lng != 0 {
+			r.Lock()
+			if !isSameDay(r.currDate, ts) {
+				// need to compute timings for today
+				r.sunrise = calcTimeAtSunAngle(ts, true, 96, r.lat, r.lng)
+				r.sunset = calcTimeAtSunAngle(ts, false, 96, r.lat, r.lng)
+				r.currDate = ts
+
+				log.Printf("computed timings for %s:\nsunrise: %s\nsunset:  %s",
+					ts.Format("02 Jan 2006"),
+					r.sunrise.Format(time.RFC1123),
+					r.sunset.Format(time.RFC1123))
+			}
+			r.Unlock()
+
+			shouldTurnOn = ts.Before(r.sunrise) || ts.After(r.sunset)
+		}
+
 		r.Lock()
 
 		if !contact { // door opened
@@ -137,8 +172,6 @@ func (r *regelwerk) handleMqtt(_ mqtt.Client, msg mqtt.Message) {
 				r.session.t.Stop()
 				r.session.t = nil
 			}
-
-			shouldTurnOn := ts.Hour() >= 19 || ts.Hour() <= 7
 
 			if shouldTurnOn && !r.switchIsOn && r.session == nil {
 				log.Printf("starting session for triggered sensor")
@@ -225,6 +258,8 @@ func main() {
 		log.Fatalf("unable to parse config: %v", err)
 	}
 
+	//log.Printf("config %+v\n", cfg)
+
 	// sanity check
 	if cfg.Server == "" {
 		log.Fatal("MQTT server not specified")
@@ -235,6 +270,9 @@ func main() {
 	r := &regelwerk{
 		sensorId: cfg.Sensor,
 		switchId: cfg.Switch,
+
+		lat: cfg.Location[0],
+		lng: cfg.Location[1] * -1, // our code has inverted longitude
 	}
 
 	//mqtt.DEBUG = log.New(os.Stdout, "[MQTT]", 0)
