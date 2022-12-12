@@ -57,8 +57,10 @@ func (r *regelwerk) turnOff() {
 	r.Lock()
 
 	if r.session != nil { // check again, just in case
-		r.session.t.Stop() // just in case
-		r.session.t = nil
+		if r.session.t != nil {
+			r.session.t.Stop() // just in case
+			r.session.t = nil
+		}
 
 		// remove session entirely
 		r.session = nil
@@ -169,8 +171,10 @@ func (r *regelwerk) handleMqtt(_ mqtt.Client, msg mqtt.Message) {
 		if !contact { // door opened
 			if r.session != nil {
 				log.Printf("paused session for triggered sensor")
-				r.session.t.Stop()
-				r.session.t = nil
+				if r.session.t != nil {
+					r.session.t.Stop()
+					r.session.t = nil
+				}
 			}
 
 			if shouldTurnOn && !r.switchIsOn && r.session == nil {
