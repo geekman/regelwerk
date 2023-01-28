@@ -210,12 +210,13 @@ func (r *regelwerk) handleMqtt(_ mqtt.Client, msg mqtt.Message) {
 		// action is optional, only when it was explicit
 		action := getMapValue(payload, "action")
 
+		r.Lock()
+		defer r.Unlock()
+
 		if action == "single_right" {
 			if *debugMode {
 				log.Printf("switch actuated: %v", action)
 			}
-
-			r.Lock()
 
 			if r.session != nil {
 				log.Printf("manual override - discarding current session")
@@ -228,12 +229,10 @@ func (r *regelwerk) handleMqtt(_ mqtt.Client, msg mqtt.Message) {
 				// also destroy session
 				r.session = nil
 			}
-
-			// update internal switch status, only when triggered via manual action
-			r.switchIsOn = state == "ON"
-
-			r.Unlock()
 		}
+
+		// update internal switch status
+		r.switchIsOn = state == "ON"
 	}
 }
 
