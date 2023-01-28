@@ -46,8 +46,9 @@ type regelwerk struct {
 
 	sensorId, switchId string
 
-	switchIsOn bool
-	session    *stateSession
+	switchIsOn    bool
+	sensorContact bool
+	session       *stateSession
 }
 
 func (r *regelwerk) Lock()   { r.mu.Lock() }
@@ -168,7 +169,9 @@ func (r *regelwerk) handleMqtt(_ mqtt.Client, msg mqtt.Message) {
 
 		r.Lock()
 
-		if !contact { // door opened
+		if r.sensorContact == contact {
+			// just a periodic status message, ignore it
+		} else if !contact { // door opened
 			if r.session != nil {
 				log.Printf("paused session for triggered sensor")
 				if r.session.t != nil {
@@ -191,6 +194,9 @@ func (r *regelwerk) handleMqtt(_ mqtt.Client, msg mqtt.Message) {
 				r.session.t = time.AfterFunc(15*time.Second, r.turnOff)
 			}
 		}
+
+		// update internal state for contact sensor
+		r.sensorContact = contact
 
 		r.Unlock()
 
