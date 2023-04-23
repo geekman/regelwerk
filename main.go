@@ -296,6 +296,8 @@ func main() {
 		sensorId: cfg.Sensor,
 		switchId: cfg.Switch,
 
+		sensorContact: true, // default state: closed contact
+
 		lat: cfg.Location[0],
 		lng: cfg.Location[1] * -1, // our code has inverted longitude
 	}
