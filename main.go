@@ -30,6 +30,7 @@ type config struct {
 
 	Location [2]float64 // lat, long
 
+	OffDelay       string
 	Sensor, Switch string
 }
 
@@ -44,6 +45,7 @@ type regelwerk struct {
 	lat, lng                  float64
 	currDate, sunrise, sunset time.Time
 
+	offDelay           time.Duration
 	sensorId, switchId string
 
 	switchIsOn    bool
@@ -190,8 +192,8 @@ func (r *regelwerk) handleMqtt(_ mqtt.Client, msg mqtt.Message) {
 			}
 		} else {
 			if r.session != nil && r.session.t == nil {
-				log.Printf("starting delayed turn-off")
-				r.session.t = time.AfterFunc(15*time.Second, r.turnOff)
+				log.Printf("starting delayed turn-off after %s", r.offDelay)
+				r.session.t = time.AfterFunc(r.offDelay, r.turnOff)
 			}
 		}
 
@@ -276,7 +278,21 @@ func main() {
 		log.Fatal("invalid MQTT server: needs to be in URL format with port")
 	}
 
+	offDelay := 15 * time.Second
+	if cfg.OffDelay != "" {
+		cfg.OffDelay = strings.ReplaceAll(cfg.OffDelay, " ", "")
+
+		var err error
+		offDelay, err = time.ParseDuration(cfg.OffDelay)
+		if err != nil {
+			log.Fatalf("invalid OffDelay: %s", err)
+		} else if offDelay.Seconds() < 0 {
+			log.Fatal("OffDelay cannot be negative")
+		}
+	}
+
 	r := &regelwerk{
+		offDelay: offDelay,
 		sensorId: cfg.Sensor,
 		switchId: cfg.Switch,
 
