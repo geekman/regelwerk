@@ -264,6 +264,11 @@ var (
 func main() {
 	flag.Parse()
 
+	// check if we are running under systemd, and if so, dont output timestamps
+	if a, b := os.Getenv("INVOCATION_ID"), os.Getenv("JOURNAL_STREAM"); a != "" && b != "" {
+		log.SetFlags(0)
+	}
+
 	cfg := config{}
 	if err := parseConfig(*configFile, &cfg); err != nil {
 		log.Fatalf("unable to parse config: %v", err)
