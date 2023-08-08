@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"log"
+	"net"
 	"os"
 	"regexp"
 	"strings"
@@ -314,6 +315,7 @@ func main() {
 		SetUsername(cfg.Username).
 		SetPassword(cfg.Password).
 		SetClientID("regelwerk").
+		SetDialer(&net.Dialer{KeepAlive: -1}).
 		SetKeepAlive(60 * time.Second).
 		SetPingTimeout(2 * time.Second).
 		SetConnectRetry(true)
