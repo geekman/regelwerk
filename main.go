@@ -33,6 +33,7 @@ type config struct {
 	Server, Username, Password string
 
 	Location [2]float64 // lat, long
+	SunAngle int
 
 	OffDelay       string
 	Sensor, Switch string
@@ -74,6 +75,7 @@ type regelwerk struct {
 	mu     sync.Mutex
 	client mqtt.Client
 
+	sunAngle                  float64
 	lat, lng                  float64
 	currDate, sunrise, sunset time.Time
 
@@ -220,8 +222,8 @@ func (r *regelwerk) NowIsDusk() bool {
 
 		if !isSameDay(r.currDate, ts) {
 			// need to compute timings for today
-			r.sunrise = calcTimeAtSunAngle(ts, true, 96, r.lat, r.lng)
-			r.sunset = calcTimeAtSunAngle(ts, false, 96, r.lat, r.lng)
+			r.sunrise = calcTimeAtSunAngle(ts, true, r.sunAngle, r.lat, r.lng)
+			r.sunset = calcTimeAtSunAngle(ts, false, r.sunAngle, r.lat, r.lng)
 			r.currDate = ts
 
 			log.Printf("computed timings for %s:\nsunrise: %s\nsunset:  %s",
@@ -360,6 +362,11 @@ func main() {
 		log.Fatal("invalid MQTT server: needs to be in URL format with port")
 	}
 
+	sunAngle := 96
+	if cfg.SunAngle >= 0 {
+		sunAngle = cfg.SunAngle
+	}
+
 	offDelay := 15 * time.Second
 	if cfg.OffDelay != "" {
 		cfg.OffDelay = strings.ReplaceAll(cfg.OffDelay, " ", "")
@@ -375,11 +382,10 @@ func main() {
 
 	r := &regelwerk{
 		offDelay: offDelay,
-		sensorId: cfg.Sensor,
-		switchId: cfg.Switch,
 
-		lat: cfg.Location[0],
-		lng: cfg.Location[1] * -1, // our code has inverted longitude
+		sunAngle: float64(sunAngle),
+		lat:      cfg.Location[0],
+		lng:      cfg.Location[1] * -1, // our code has inverted longitude
 
 		timers:      make(map[string]*timer),
 		devices:     make(map[string]*device),
