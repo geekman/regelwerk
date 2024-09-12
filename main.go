@@ -3,12 +3,15 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -35,8 +38,36 @@ type config struct {
 	Sensor, Switch string
 }
 
-type stateSession struct {
-	t *time.Timer
+type device struct {
+	id          string // internal device ID
+	topic       string // MQTT topic
+	stateAttr   string // state attribute
+	state       any    // current state
+	lastUpdated time.Time
+}
+
+func (d *device) DecodePayload(msg mqtt.Message) (payload map[string]any, changed bool, err error) {
+	payload, err = decodePayload(msg)
+	if err != nil {
+		return payload, false, fmt.Errorf("unable to parse MQTT payload: %v", err)
+	}
+
+	changed = false
+
+	if d.stateAttr != "" {
+		attr, ok := payload[d.stateAttr]
+		if !ok {
+			return payload, false, fmt.Errorf("state attr %q not found for %q", d.stateAttr, d.topic)
+		}
+
+		// check and toggle state
+		if attr != d.state && reflect.TypeOf(attr) == reflect.TypeOf(d.state) {
+			d.state = attr
+			changed = true
+		}
+	}
+
+	return payload, changed, nil
 }
 
 type regelwerk struct {
@@ -49,31 +80,165 @@ type regelwerk struct {
 	offDelay           time.Duration
 	sensorId, switchId string
 
-	switchIsOn    bool
-	sensorContact bool
-	session       *stateSession
+	// timers
+	timers   map[string]*timer
+	timersMu sync.Mutex
+
+	// devices
+	devices     map[string]*device
+	devicesById map[string]*device
+}
+
+func (r *regelwerk) AddDevice(d *device) {
+	r.devices[d.topic] = d
+	r.devicesById[d.id] = d
+}
+
+func (r *regelwerk) LookupDevice(id string) *device {
+	return r.devicesById[id]
+}
+
+// timers management
+
+type timer struct {
+	t, expT *time.Timer
+	fired   atomic.Uint32
+}
+
+func (r *regelwerk) mkTimerFunc(name string, expired bool, tm *timer) func() {
+	return func() {
+		// guard against timeout & expiry firing twice
+		if tm.fired.CompareAndSwap(0, 1) {
+			if *debugMode {
+				ev := "fired"
+				if expired {
+					ev = "expired"
+				}
+				log.Printf("timer %q %s", name, ev)
+			}
+
+			r.Lock()
+			r.handleTimer(name, expired)
+			r.Unlock()
+
+			r.timersMu.Lock()
+			defer r.timersMu.Unlock()
+
+			if r.timers[name] == tm {
+				delete(r.timers, name)
+			}
+		}
+	}
+}
+
+func (r *regelwerk) AddTimer(name string) *timer {
+	tm := &timer{}
+	t := time.AfterFunc(time.Hour, r.mkTimerFunc(name, false, tm))
+	t.Stop()
+	tm.t = t
+
+	r.timersMu.Lock()
+	defer r.timersMu.Unlock()
+
+	// do not overwrite existing timers
+	if _, exists := r.timers[name]; !exists {
+		r.timers[name] = tm
+		return tm
+	}
+	return nil
+}
+
+func (r *regelwerk) AddTimerWithExpiry(name string, expiry time.Duration) *timer {
+	tm := r.AddTimer(name)
+	// attach an expiry timer. this is unreferenced and there's no way to stop it
+	if tm != nil {
+		tm.expT = time.AfterFunc(expiry, r.mkTimerFunc(name, true, tm))
+	}
+	return tm
+}
+
+func (r *regelwerk) DestroyTimer(name string) bool {
+	r.timersMu.Lock()
+	defer r.timersMu.Unlock()
+
+	if t := r.timers[name]; t != nil {
+		t.t.Stop()
+		if t.expT != nil {
+			t.expT.Stop()
+		}
+
+		delete(r.timers, name)
+		return true
+	}
+
+	return false
+}
+
+// Tries to (re)start timer if it exists
+// Returns whether the timer was found, false if it wasn't
+func (r *regelwerk) StartTimer(name string, dur time.Duration) bool {
+	r.timersMu.Lock()
+	defer r.timersMu.Unlock()
+
+	t, found := r.timers[name]
+	if !found {
+		return false
+	}
+
+	t.t.Reset(dur)
+	return true
+}
+
+// Stop a timer, if found
+// Does not affect the expiry timer; that continues running
+func (r *regelwerk) StopTimer(name string) *timer {
+	r.timersMu.Lock()
+	defer r.timersMu.Unlock()
+
+	t, found := r.timers[name]
+	if !found {
+		return nil
+	}
+
+	t.t.Stop()
+	return t
+}
+
+// Determines if it's dusk
+// If the location is specified in the config file, lazily computes the sunset/sunrise time
+// or else just use a 7-to-7 time as the default dusk.
+func (r *regelwerk) NowIsDusk() bool {
+	ts := time.Now()
+
+	// default dusk/dawn logic, 7pm - 7am
+	isDusk := ts.Hour() >= 19 || ts.Hour() < 7
+
+	// see if we should compute sunset/sunrise times
+	if r.lat != 0 && r.lng != 0 {
+		// lock already held in handleDeviceEvent
+		//r.Lock()
+
+		if !isSameDay(r.currDate, ts) {
+			// need to compute timings for today
+			r.sunrise = calcTimeAtSunAngle(ts, true, 96, r.lat, r.lng)
+			r.sunset = calcTimeAtSunAngle(ts, false, 96, r.lat, r.lng)
+			r.currDate = ts
+
+			log.Printf("computed timings for %s:\nsunrise: %s\nsunset:  %s",
+				ts.Format("02 Jan 2006"),
+				r.sunrise.Format(time.RFC1123),
+				r.sunset.Format(time.RFC1123))
+		}
+		//r.Unlock()
+
+		isDusk = ts.Before(r.sunrise) || ts.After(r.sunset)
+	}
+
+	return isDusk
 }
 
 func (r *regelwerk) Lock()   { r.mu.Lock() }
 func (r *regelwerk) Unlock() { r.mu.Unlock() }
-
-func (r *regelwerk) turnOff() {
-	r.Lock()
-
-	if r.session != nil { // check again, just in case
-		if r.session.t != nil {
-			r.session.t.Stop() // just in case
-			r.session.t = nil
-		}
-
-		// remove session entirely
-		r.session = nil
-	}
-
-	r.Unlock()
-
-	r.sendSwitchState(false)
-}
 
 func (r *regelwerk) sendSwitchState(turnOn bool) {
 	state := "OFF"
@@ -128,120 +293,31 @@ func (r *regelwerk) handleMqtt(_ mqtt.Client, msg mqtt.Message) {
 		return
 	}
 
-	ts := time.Now()
-
 	if *debugMode {
 		log.Printf("recv %q, payload %s", msg.Topic(), msg.Payload())
 	}
 
-	switch topic {
-	case r.sensorId:
-		payload, err := decodePayload(msg)
-		if err != nil {
-			log.Printf("unable to parse MQTT payload: %v", err)
-			return
-		}
-
-		contact, ok := payload["contact"].(bool)
-		if !ok {
-			log.Printf("invalid contact value in payload: %+v", payload)
-			return
-		}
-
-		// default dusk/dawn logic, 7pm - 7am
-		shouldTurnOn := ts.Hour() >= 19 || ts.Hour() < 7
-
-		// see if we should compute sunset/sunrise times
-		if r.lat != 0 && r.lng != 0 {
-			r.Lock()
-			if !isSameDay(r.currDate, ts) {
-				// need to compute timings for today
-				r.sunrise = calcTimeAtSunAngle(ts, true, 96, r.lat, r.lng)
-				r.sunset = calcTimeAtSunAngle(ts, false, 96, r.lat, r.lng)
-				r.currDate = ts
-
-				log.Printf("computed timings for %s:\nsunrise: %s\nsunset:  %s",
-					ts.Format("02 Jan 2006"),
-					r.sunrise.Format(time.RFC1123),
-					r.sunset.Format(time.RFC1123))
-			}
-			r.Unlock()
-
-			shouldTurnOn = ts.Before(r.sunrise) || ts.After(r.sunset)
-		}
-
-		r.Lock()
-
-		if r.sensorContact == contact {
-			// just a periodic status message, ignore it
-		} else if !contact { // door opened
-			if r.session != nil {
-				log.Printf("paused session for triggered sensor")
-				if r.session.t != nil {
-					r.session.t.Stop()
-					r.session.t = nil
-				}
-			}
-
-			if shouldTurnOn && !r.switchIsOn && r.session == nil {
-				log.Printf("starting session for triggered sensor")
-
-				r.session = &stateSession{}
-
-				// send after mutex unlock
-				defer r.sendSwitchState(true)
-			}
-		} else {
-			if r.session != nil && r.session.t == nil {
-				log.Printf("starting delayed turn-off after %s", r.offDelay)
-				r.session.t = time.AfterFunc(r.offDelay, r.turnOff)
-			}
-		}
-
-		// update internal state for contact sensor
-		r.sensorContact = contact
-
-		r.Unlock()
-
-	case r.switchId:
-		payload, err := decodePayload(msg)
-		if err != nil {
-			log.Printf("unable to parse MQTT payload: %v", err)
-			return
-		}
-
-		state := getMapValue(payload, "state_right")
-		if state == "" {
-			log.Printf("invalid/missing state_xxx value in payload: %+v", payload)
-			return
-		}
-
-		// action is optional, only when it was explicit
-		action := getMapValue(payload, "action")
-
+	dev, found := r.devices[topic]
+	if found {
 		r.Lock()
 		defer r.Unlock()
 
-		if action == "single_right" {
-			if *debugMode {
-				log.Printf("switch actuated: %v", action)
-			}
+		payload, changed, err := dev.DecodePayload(msg)
+		if err != nil {
+			log.Printf("error parsing MQTT msg: %v", err)
+		} else {
+			// fire for arbitrary events
+			r.handleDeviceEvent(dev, payload)
 
-			if r.session != nil {
-				log.Printf("manual override - discarding current session")
-
-				if r.session.t != nil {
-					r.session.t.Stop()
-					r.session.t = nil
+			// fire only on change events
+			if changed {
+				if *debugMode {
+					log.Printf("dev %q (%q) state %q changed to %#v",
+						dev.id, dev.topic, dev.stateAttr, dev.state)
 				}
-
-				// also destroy session
-				r.session = nil
+				r.handleDeviceChangedEvent(dev, payload)
 			}
 		}
-
-		// update internal switch status
-		r.switchIsOn = state == "ON"
 	}
 }
 
@@ -302,11 +378,28 @@ func main() {
 		sensorId: cfg.Sensor,
 		switchId: cfg.Switch,
 
-		sensorContact: true, // default state: closed contact
-
 		lat: cfg.Location[0],
 		lng: cfg.Location[1] * -1, // our code has inverted longitude
+
+		timers:      make(map[string]*timer),
+		devices:     make(map[string]*device),
+		devicesById: make(map[string]*device),
 	}
+
+	// add devices
+	r.AddDevice(&device{
+		id:        "contact",
+		topic:     r.sensorId,
+		stateAttr: "contact",
+		state:     true,
+	})
+
+	r.AddDevice(&device{
+		id:        "switch",
+		topic:     r.switchId,
+		stateAttr: "state_right",
+		state:     "OFF",
+	})
 
 	//mqtt.DEBUG = log.New(os.Stdout, "[MQTT]", 0)
 
