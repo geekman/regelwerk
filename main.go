@@ -35,8 +35,31 @@ type config struct {
 	Location [2]float64 // lat, long
 	SunAngle int
 
-	OffDelay       string
+	OffDelay       textDuration
+	MotionOffDelay textDuration
+	MotionExpiry   textDuration
 	Sensor, Switch string
+	MotionSensor   string
+}
+
+type textDuration time.Duration
+
+func (d *textDuration) UnmarshalText(b []byte) error {
+	// tolerate spaces
+	t := strings.ReplaceAll(string(b), " ", "")
+	if t == "" {
+		return nil
+	}
+
+	dur, err := time.ParseDuration(t)
+	if err != nil {
+		return err
+	} else if dur.Seconds() < 0 {
+		return fmt.Errorf("duration cannot be negative")
+	}
+
+	*d = textDuration(dur)
+	return nil
 }
 
 type device struct {
@@ -71,6 +94,27 @@ func (d *device) DecodePayload(msg mqtt.Message) (payload map[string]any, change
 	return payload, changed, nil
 }
 
+func (d *device) SendNewState(c mqtt.Client, newState any) {
+	payload := map[string]any{
+		d.stateAttr: newState,
+	}
+	js, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("error encoding to JSON %+v: %v", payload, err)
+		return
+	}
+
+	if *debugMode {
+		log.Printf("sending dev %s payload: %q", d.id, js)
+	}
+
+	d.SendPayload(c, js)
+}
+
+func (d *device) SendPayload(c mqtt.Client, payload []byte) {
+	c.Publish(MQTT_TOPIC_PREFIX+d.topic+"/set", 0, false, payload)
+}
+
 type regelwerk struct {
 	mu     sync.Mutex
 	client mqtt.Client
@@ -79,8 +123,9 @@ type regelwerk struct {
 	lat, lng                  float64
 	currDate, sunrise, sunset time.Time
 
-	offDelay           time.Duration
-	sensorId, switchId string
+	motionOffDelay time.Duration
+	motionExpiry   time.Duration
+	offDelay       time.Duration
 
 	// timers
 	timers   map[string]*timer
@@ -242,20 +287,6 @@ func (r *regelwerk) NowIsDusk() bool {
 func (r *regelwerk) Lock()   { r.mu.Lock() }
 func (r *regelwerk) Unlock() { r.mu.Unlock() }
 
-func (r *regelwerk) sendSwitchState(turnOn bool) {
-	state := "OFF"
-	if turnOn {
-		state = "ON"
-	}
-
-	if *debugMode {
-		log.Printf("turning switch %v now", state)
-	}
-
-	r.client.Publish(MQTT_TOPIC_PREFIX+r.switchId+"/set", 0, false,
-		`{"state_right":"`+state+`"}`)
-}
-
 // Decodes the payload as a JSON map
 func decodePayload(msg mqtt.Message) (map[string]any, error) {
 	var m map[string]any
@@ -348,7 +379,14 @@ func main() {
 		log.SetFlags(0)
 	}
 
-	cfg := config{}
+	cfg := config{
+		// default values
+		SunAngle: 96,
+
+		OffDelay:       textDuration(15 * time.Second),
+		MotionOffDelay: textDuration(100 * time.Second),
+		MotionExpiry:   textDuration(5 * time.Minute),
+	}
 	if err := parseConfig(*configFile, &cfg); err != nil {
 		log.Fatalf("unable to parse config: %v", err)
 	}
@@ -362,28 +400,12 @@ func main() {
 		log.Fatal("invalid MQTT server: needs to be in URL format with port")
 	}
 
-	sunAngle := 96
-	if cfg.SunAngle >= 0 {
-		sunAngle = cfg.SunAngle
-	}
-
-	offDelay := 15 * time.Second
-	if cfg.OffDelay != "" {
-		cfg.OffDelay = strings.ReplaceAll(cfg.OffDelay, " ", "")
-
-		var err error
-		offDelay, err = time.ParseDuration(cfg.OffDelay)
-		if err != nil {
-			log.Fatalf("invalid OffDelay: %s", err)
-		} else if offDelay.Seconds() < 0 {
-			log.Fatal("OffDelay cannot be negative")
-		}
-	}
-
 	r := &regelwerk{
-		offDelay: offDelay,
+		offDelay:       time.Duration(cfg.OffDelay),
+		motionOffDelay: time.Duration(cfg.MotionOffDelay),
+		motionExpiry:   time.Duration(cfg.MotionExpiry),
 
-		sunAngle: float64(sunAngle),
+		sunAngle: float64(cfg.SunAngle),
 		lat:      cfg.Location[0],
 		lng:      cfg.Location[1] * -1, // our code has inverted longitude
 
@@ -395,14 +417,23 @@ func main() {
 	// add devices
 	r.AddDevice(&device{
 		id:        "contact",
-		topic:     r.sensorId,
+		topic:     cfg.Sensor,
 		stateAttr: "contact",
 		state:     true,
 	})
 
+	if cfg.MotionSensor != "" {
+		r.AddDevice(&device{
+			id:        "motion",
+			topic:     cfg.MotionSensor,
+			stateAttr: "occupancy",
+			state:     false,
+		})
+	}
+
 	r.AddDevice(&device{
 		id:        "switch",
-		topic:     r.switchId,
+		topic:     cfg.Switch,
 		stateAttr: "state_right",
 		state:     "OFF",
 	})
